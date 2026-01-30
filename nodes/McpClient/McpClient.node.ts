@@ -3,7 +3,6 @@ import {
 	INodeExecutionData,
 	INodeType,
 	INodeTypeDescription,
-	NodeConnectionType,
 	NodeOperationError,
 } from 'n8n-workflow';
 import { DynamicStructuredTool } from '@langchain/core/tools';
@@ -479,19 +478,10 @@ export class McpClient implements INodeType {
 				};
 			}
 
-			const client = new Client(
-				{
-					name: `${McpClient.name}-client`,
-					version: '1.0.0',
-				},
-				{
-					capabilities: {
-						prompts: {},
-						resources: {},
-						tools: {},
-					},
-				},
-			);
+			const client = new Client({
+				name: `${McpClient.name}-client`,
+				version: '1.0.0',
+			});
 
 			try {
 				if (!transport) {
@@ -641,7 +631,7 @@ export class McpClient implements INodeType {
 								tools: aiTools.map((t: DynamicStructuredTool) => ({
 									name: t.name,
 									description: t.description,
-									schema: zodToJsonSchema(t.schema as z.ZodTypeAny || z.object({})),
+									schema: zodToJsonSchema(t.schema as any || z.object({})),
 								})),
 							},
 							pairedItem: { item: itemIndex },
