@@ -1,7 +1,7 @@
 {
 	"name": "n8n-nodes-mcp-batch",
-	"version": "0.1.31",
-	"description": "MCP nodes for n8n ",
+	"version": "0.1.33",
+	"description": "MCP nodes for n8n with batching support",
 	"keywords": [
 		"n8n-community-node-package",
 		"mcp",
@@ -9,7 +9,8 @@
 		"mcp-client-node",
 		"mcp-client-n8n",
 		"mcp-client-n8n-node",
-		"mcp-client-n8n-node-package"
+		"mcp-client-n8n-node-package",
+		"batch"
 	],
 	"license": "MIT",
 	"homepage": "https://github.com/eonminion/n8n-nodes-mcp-batch#readme",
@@ -20,6 +21,9 @@
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/eonminion/n8n-nodes-mcp-batch.git"
+	},
+	"bugs": {
+		"url": "https://github.com/eonminion/n8n-nodes-mcp-batch/issues"
 	},
 	"main": "index.js",
 	"scripts": {
@@ -50,7 +54,7 @@
 	},
 	"devDependencies": {
 		"@types/jest": "^29.5.14",
-		"@types/node": "^24.10.0",
+		"@types/node": "^24.0.13",
 		"@typescript-eslint/parser": "~8.36",
 		"eslint": "^8.57.1",
 		"eslint-plugin-n8n-nodes-base": "^1.11.0",
@@ -62,19 +66,15 @@
 		"typescript": "~5.8.3"
 	},
 	"dependencies": {
-		"@langchain/core": "^1.1.18",
+		"@langchain/core": "0.3.43",
 		"@modelcontextprotocol/sdk": "^1.15.1",
-		"zod": "^4.3.6",
-		"zod-to-json-schema": "^3.25.1"
+		"zod": "^3.25.0",
+		"zod-to-json-schema": "^3.24.6"
 	},
 	"overrides": {
-		"pkce-challenge": "3.0.0",
-		"zod": "^4.3.6"
+		"pkce-challenge": "3.0.0"
 	},
 	"peerDependencies": {
 		"n8n-workflow": "*"
-	},
-	"bugs": {
-		"url": "https://github.com/eonminion/n8n-nodes-mcp-batch/issues"
 	}
 }

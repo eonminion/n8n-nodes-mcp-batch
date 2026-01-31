@@ -3,24 +3,21 @@ import {
 	INodeExecutionData,
 	INodeType,
 	INodeTypeDescription,
+	NodeConnectionType,
 	NodeOperationError,
 } from 'n8n-workflow';
-import { DynamicStructuredTool } from '@langchain/core/tools';
-import { z } from 'zod';
-import { zodToJsonSchema } from 'zod-to-json-schema';
+
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { RequestOptions } from '@modelcontextprotocol/sdk/shared/protocol';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js';
+import { parseHeaders, mergeHeaders } from './utils';
 
 // Add Node.js process type declaration
 declare const process: {
 	env: Record<string, string | undefined>;
 };
-
-// Add Node.js setTimeout type declaration
-declare function setTimeout(callback: () => void, ms: number): NodeJS.Timeout;
 
 export class McpClient implements INodeType {
 	description: INodeTypeDescription = {
@@ -103,6 +100,19 @@ export class McpClient implements INodeType {
 				},
 				default: '',
 				description: 'Override the URL from credentials with a custom URL',
+			},
+			{
+				displayName: 'Headers Override',
+				name: 'headersOverride',
+				type: 'string',
+				displayOptions: {
+					show: {
+						connectionType: ['sse', 'http'],
+					},
+				},
+				default: '',
+				description:
+					'Additional headers to send in the request in NAME=VALUE format, separated by newlines (e.g., Authorization=Bearer token). These will be merged with headers from credentials, with override headers taking precedence.',
 			},
 			{
 				displayName: 'Operation',
@@ -219,46 +229,44 @@ export class McpClient implements INodeType {
 						displayName: 'Batching',
 						name: 'batching',
 						type: 'fixedCollection',
-						placeholder: 'Add Batching',
-						default: {
-							batch: {
-								batchSize: 50,
-								batchInterval: 1000,
-							},
-						},
 						typeOptions: {
 							multipleValues: false,
 						},
+						default: {
+							batch: {
+								batchSize: 10,
+								batchInterval: 1000,
+							},
+						},
 						options: [
 							{
-								displayName: '',
+								displayName: 'Batch Configuration',
 								name: 'batch',
 								values: [
 									{
-										displayName: 'Items Per Batch',
+										displayName: 'Batch Size',
 										name: 'batchSize',
 										type: 'number',
-										default: 50,
-										description: 'Number of items to process in parallel per batch',
 										typeOptions: {
 											minValue: 1,
-											maxValue: 1000,
 										},
+										default: 10,
+										description: 'Number of items to process in each batch',
 									},
 									{
-										displayName: 'Batch Interval (MS)',
+										displayName: 'Batch Interval (Ms)',
 										name: 'batchInterval',
 										type: 'number',
-										default: 1000,
-										description: 'Time to wait between batches in milliseconds',
 										typeOptions: {
 											minValue: 0,
-											maxValue: 60000,
 										},
+										default: 1000,
+										description: 'Time to wait between batches in milliseconds',
 									},
 								],
 							},
 						],
+						description: 'Configure batching for processing multiple items',
 					},
 				],
 			},
@@ -268,9 +276,10 @@ export class McpClient implements INodeType {
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 		const items = this.getInputData();
 		const returnData: INodeExecutionData[] = [];
+		const operation = this.getNodeParameter('operation', 0) as string;
 		let transport: Transport | undefined;
 
-		// Get batching configuration from options (disabled by default)
+		// Get batch configuration from options
 		const options = this.getNodeParameter('options', 0, {}) as {
 			batching?: {
 				batch?: {
@@ -279,16 +288,9 @@ export class McpClient implements INodeType {
 				};
 			};
 		};
-
-		// Extract batching settings - batching is enabled if the batching option exists
-		const batchConfig = options.batching?.batch;
-		const batchingEnabled = options.batching !== undefined && batchConfig !== undefined;
-
-		// Sanitize and clamp batch configuration to prevent infinite loops and ensure valid ranges
-		const rawBatchSize = batchingEnabled ? batchConfig?.batchSize ?? 50 : items.length || 1;
-		const itemsPerBatch = Math.max(1, Math.min(1000, Number.isFinite(rawBatchSize) ? Math.floor(rawBatchSize) : 50));
-		const rawBatchInterval = batchingEnabled ? batchConfig?.batchInterval ?? 1000 : 0;
-		const batchInterval = Math.max(0, Math.min(60000, Number.isFinite(rawBatchInterval) ? Math.floor(rawBatchInterval) : 0));
+		const batchConfig = options.batching?.batch ?? { batchSize: items.length, batchInterval: 0 };
+		const batchSize = batchConfig.batchSize ?? items.length;
+		const batchInterval = batchConfig.batchInterval ?? 0;
 
 		// For backward compatibility - if connectionType isn't set, default to 'cmd'
 		let connectionType = 'cmd';
@@ -326,23 +328,20 @@ export class McpClient implements INodeType {
 				const messagesPostEndpoint = (httpCredentials.messagesPostEndpoint as string) || '';
 				timeout = httpCredentials.httpTimeout as number || 60000;
 
-				// Parse headers
-				let headers: Record<string, string> = {};
-				if (httpCredentials.headers) {
-					const headerLines = (httpCredentials.headers as string).split('\n');
-					for (const line of headerLines) {
-						const equalsIndex = line.indexOf('=');
-						// Ensure '=' is present and not the first character of the line
-						if (equalsIndex > 0) {
-							const name = line.substring(0, equalsIndex).trim();
-							const value = line.substring(equalsIndex + 1).trim();
-							// Add to headers object if key is not empty and value is defined
-							if (name && value !== undefined) {
-								headers[name] = value;
-							}
-						}
-					}
+				// Parse headers from credentials
+				const credentialHeaders = parseHeaders((httpCredentials.headers as string) || '');
+
+				// Get headers override
+				let headersOverrideStr = '';
+				try {
+					headersOverrideStr = this.getNodeParameter('headersOverride', 0, '') as string;
+				} catch (error) {
+					// Parameter doesn't exist, ignore
 				}
+				const overrideHeaders = parseHeaders(headersOverrideStr);
+
+				// Merge headers with override headers taking precedence
+				const headers = mergeHeaders(credentialHeaders, overrideHeaders);
 
 				const requestInit: RequestInit = { headers };
 				if (messagesPostEndpoint) {
@@ -377,23 +376,20 @@ export class McpClient implements INodeType {
 				const messagesPostEndpoint = (sseCredentials.messagesPostEndpoint as string) || '';
 				timeout = sseCredentials.sseTimeout as number || 60000;
 
-				// Parse headers
-				let headers: Record<string, string> = {};
-				if (sseCredentials.headers) {
-					const headerLines = (sseCredentials.headers as string).split('\n');
-					for (const line of headerLines) {
-						const equalsIndex = line.indexOf('=');
-						// Ensure '=' is present and not the first character of the line
-						if (equalsIndex > 0) {
-							const name = line.substring(0, equalsIndex).trim();
-							const value = line.substring(equalsIndex + 1).trim();
-							// Add to headers object if key is not empty and value is defined
-							if (name && value !== undefined) {
-								headers[name] = value;
-							}
-						}
-					}
+				// Parse headers from credentials
+				const credentialHeaders = parseHeaders((sseCredentials.headers as string) || '');
+
+				// Get headers override
+				let headersOverrideStr = '';
+				try {
+					headersOverrideStr = this.getNodeParameter('headersOverride', 0, '') as string;
+				} catch (error) {
+					// Parameter doesn't exist, ignore
 				}
+				const overrideHeaders = parseHeaders(headersOverrideStr);
+
+				// Merge headers with override headers taking precedence
+				const headers = mergeHeaders(credentialHeaders, overrideHeaders);
 
 				// Create SSE transport with dynamic import to avoid TypeScript errors
 				transport = new SSEClientTransport(
@@ -478,10 +474,19 @@ export class McpClient implements INodeType {
 				};
 			}
 
-			const client = new Client({
-				name: `${McpClient.name}-client`,
-				version: '1.0.0',
-			});
+			const client = new Client(
+				{
+					name: `${McpClient.name}-client`,
+					version: '1.0.0',
+				},
+				{
+					capabilities: {
+						prompts: {},
+						resources: {},
+						tools: {},
+					},
+				},
+			);
 
 			try {
 				if (!transport) {
@@ -501,40 +506,38 @@ export class McpClient implements INodeType {
 			const requestOptions: RequestOptions = {};
 			requestOptions.timeout = timeout;
 
-			// Helper function to process a single item
-			const processItem = async (itemIndex: number): Promise<INodeExecutionData> => {
-				const operation = this.getNodeParameter('operation', itemIndex) as string;
+			switch (operation) {
+				case 'listResources': {
+					const resources = await client.listResources();
+					returnData.push({
+						json: { resources },
+					});
+					break;
+				}
 
-				switch (operation) {
-					case 'listResources': {
-						const resources = await client.listResources();
-						return {
-							json: { resources },
-							pairedItem: { item: itemIndex },
-						};
-					}
+				case 'listResourceTemplates': {
+					const resourceTemplates = await client.listResourceTemplates();
+					returnData.push({
+						json: { resourceTemplates },
+					});
+					break;
+				}
 
-					case 'listResourceTemplates': {
-						const resourceTemplates = await client.listResourceTemplates();
-						return {
-							json: { resourceTemplates },
-							pairedItem: { item: itemIndex },
-						};
-					}
+				case 'readResource': {
+					const uri = this.getNodeParameter('resourceUri', 0) as string;
+					const resource = await client.readResource({
+						uri,
+					});
+					returnData.push({
+						json: { resource },
+					});
+					break;
+				}
 
-					case 'readResource': {
-						const uri = this.getNodeParameter('resourceUri', itemIndex) as string;
-						const resource = await client.readResource({
-							uri,
-						});
-						return {
-							json: { resource },
-							pairedItem: { item: itemIndex },
-						};
-					}
-
-						case 'listTools': {
+				case 'listTools': {
+					try {
 						const rawTools = await client.listTools();
+						this.logger.debug(`[MCP][listTools] Received tools from server: ${JSON.stringify(rawTools, null, 2)}`);
 						const tools = Array.isArray(rawTools)
 							? rawTools
 							: Array.isArray(rawTools?.tools)
@@ -548,143 +551,71 @@ export class McpClient implements INodeType {
 							throw new NodeOperationError(this.getNode(), 'No tools found from MCP client');
 						}
 
-						const aiTools = tools.map((tool: any) => {
-							const paramSchema = tool.inputSchema?.properties
-								? z.object(
-									Object.entries(tool.inputSchema.properties).reduce(
-										(acc: any, [key, prop]: [string, any]) => {
-											let zodType: z.ZodType;
-
-											switch (prop.type) {
-												case 'string':
-													zodType = z.string();
-													break;
-												case 'number':
-													zodType = z.number();
-													break;
-												case 'integer':
-													zodType = z.number().int();
-													break;
-												case 'boolean':
-													zodType = z.boolean();
-													break;
-												case 'array':
-													if (prop.items?.type === 'string') {
-														zodType = z.array(z.string());
-													} else if (prop.items?.type === 'number') {
-														zodType = z.array(z.number());
-													} else if (prop.items?.type === 'boolean') {
-														zodType = z.array(z.boolean());
-													} else {
-														zodType = z.array(z.any());
-													}
-													break;
-												case 'object':
-													zodType = z.record(z.string(), z.any());
-													break;
-												default:
-													zodType = z.any();
-											}
-
-											if (prop.description) {
-												zodType = zodType.describe(prop.description);
-											}
-
-											if (!tool.inputSchema?.required?.includes(key)) {
-												zodType = zodType.optional();
-											}
-
-											return {
-												...acc,
-												[key]: zodType,
-											};
-										},
-										{},
-									),
-								)
-								: z.object({});
-
-							return new DynamicStructuredTool({
-								name: tool.name,
-								description: tool.description || `Execute the ${tool.name} tool`,
-								schema: paramSchema,
-								func: async (params) => {
-									try {
-										const result = await client.callTool({
-											name: tool.name,
-											arguments: params,
-										}, CallToolResultSchema, requestOptions);
-
-										return typeof result === 'object' ? JSON.stringify(result) : String(result);
-									} catch (error) {
-										throw new NodeOperationError(
-											this.getNode(),
-											`Failed to execute ${tool.name}: ${(error as Error).message}`,
-										);
-									}
-								},
-							});
+						const outputTools = tools.map((tool: any) => ({
+							name: tool.name,
+							description: tool.description || `Execute the ${tool.name} tool`,
+							schema: tool.inputSchema,
+						}));
+						this.logger.debug(`[MCP][listTools] Returning tools with schemas: ${JSON.stringify(outputTools, null, 2)}`);
+						returnData.push({
+							json: { tools: outputTools },
 						});
-
-						return {
-							json: {
-								tools: aiTools.map((t: DynamicStructuredTool) => ({
-									name: t.name,
-									description: t.description,
-									schema: zodToJsonSchema(t.schema as any || z.object({})),
-								})),
-							},
-							pairedItem: { item: itemIndex },
-						};
+						break;
+					} catch (error) {
+						this.logger.error(`[MCP][listTools] Error in listTools operation: ${JSON.stringify(error, null, 2)}`);
+						throw new NodeOperationError(this.getNode(), `Error in listTools operation: ${(error as Error).message}`);
 					}
+				}
 
-					case 'executeTool': {
+				case 'executeTool': {
+					// Helper function to process a single item
+					const processItem = async (itemIndex: number): Promise<INodeExecutionData> => {
 						const toolName = this.getNodeParameter('toolName', itemIndex) as string;
 						let toolParams;
 
 						try {
 							const rawParams = this.getNodeParameter('toolParameters', itemIndex);
-							this.logger.debug(`Raw tool parameters: ${JSON.stringify(rawParams)}`);
+							this.logger.debug(`Raw tool parameters for item ${itemIndex}: ${JSON.stringify(rawParams)}`);
 
 							// Handle different parameter types
 							if (rawParams === undefined || rawParams === null) {
-								// Handle null/undefined case
 								toolParams = {};
 							} else if (typeof rawParams === 'string') {
-								// Handle string input (typical direct node usage)
 								if (!rawParams || rawParams.trim() === '') {
 									toolParams = {};
 								} else {
 									toolParams = JSON.parse(rawParams);
 								}
 							} else if (typeof rawParams === 'object') {
-								// Handle object input (when used as a tool in AI Agent)
 								toolParams = rawParams;
 							} else {
-								// Try to convert other types to object
 								try {
 									toolParams = JSON.parse(JSON.stringify(rawParams));
 								} catch (parseError) {
 									throw new NodeOperationError(
 										this.getNode(),
 										`Invalid parameter type: ${typeof rawParams}`,
+										{ itemIndex },
 									);
 								}
 							}
 
-							// Ensure toolParams is an object
 							if (
 								typeof toolParams !== 'object' ||
 								toolParams === null ||
 								Array.isArray(toolParams)
 							) {
-								throw new NodeOperationError(this.getNode(), 'Tool parameters must be a JSON object');
+								throw new NodeOperationError(
+									this.getNode(),
+									'Tool parameters must be a JSON object',
+									{ itemIndex },
+								);
 							}
 						} catch (error) {
 							throw new NodeOperationError(
 								this.getNode(),
-								`Failed to parse tool parameters: ${(error as Error).message
-								}. Make sure the parameters are valid JSON.`,
+								`Failed to parse tool parameters: ${(error as Error).message}. Make sure the parameters are valid JSON.`,
+								{ itemIndex },
 							);
 						}
 
@@ -703,11 +634,12 @@ export class McpClient implements INodeType {
 							throw new NodeOperationError(
 								this.getNode(),
 								`Tool '${toolName}' does not exist. Available tools: ${availableToolNames}`,
+								{ itemIndex },
 							);
 						}
 
 						this.logger.debug(
-							`Executing tool: ${toolName} with params: ${JSON.stringify(toolParams)}`,
+							`Executing tool: ${toolName} with params: ${JSON.stringify(toolParams)} for item ${itemIndex}`,
 						);
 
 						const result = await client.callTool({
@@ -715,74 +647,58 @@ export class McpClient implements INodeType {
 							arguments: toolParams,
 						}, CallToolResultSchema, requestOptions);
 
-						this.logger.debug(`Tool executed successfully: ${JSON.stringify(result)}`);
+						this.logger.debug(`Tool executed successfully for item ${itemIndex}: ${JSON.stringify(result)}`);
 
 						return {
 							json: { result },
 							pairedItem: { item: itemIndex },
 						};
-					}
+					};
 
-					case 'listPrompts': {
-						const prompts = await client.listPrompts();
-						return {
-							json: { prompts },
-							pairedItem: { item: itemIndex },
-						};
-					}
+					// Process items in batches
+					for (let i = 0; i < items.length; i += batchSize) {
+						const batch = items.slice(i, i + batchSize);
+						const batchPromises = batch.map((_, batchIndex) => processItem(i + batchIndex));
 
-					case 'getPrompt': {
-						const promptName = this.getNodeParameter('promptName', itemIndex) as string;
-						const prompt = await client.getPrompt({
-							name: promptName,
-						});
-						return {
-							json: { prompt },
-							pairedItem: { item: itemIndex },
-						};
-					}
+						try {
+							const batchResults = await Promise.all(batchPromises);
+							returnData.push(...batchResults);
+						} catch (error) {
+							throw new NodeOperationError(
+								this.getNode(),
+								`Failed to execute tool batch: ${(error as Error).message}`,
+							);
+						}
 
-					default:
-						throw new NodeOperationError(this.getNode(), `Operation ${operation} not supported`);
-				}
-			};
-
-			// Process items in batches
-			for (let batchStart = 0; batchStart < items.length; batchStart += itemsPerBatch) {
-				const batchEnd = Math.min(batchStart + itemsPerBatch, items.length);
-				const batchItems = items.slice(batchStart, batchEnd);
-
-				// Process all items in the current batch in parallel
-				const batchPromises = batchItems.map(async (_item: INodeExecutionData, index: number) => {
-					const itemIndex = batchStart + index;
-					try {
-						return await processItem(itemIndex);
-					} catch (itemError) {
-						// Handle errors per item - if continueOnFail is enabled, add error to results
-						// Otherwise, rethrow the error to stop execution
-						if (this.continueOnFail()) {
-							return {
-								json: {
-									error: (itemError as Error).message,
-								},
-								pairedItem: { item: itemIndex },
-							};
-						} else {
-							throw itemError;
+						// Wait for batch interval before processing next batch (except for last batch)
+						if (i + batchSize < items.length && batchInterval > 0) {
+							await new Promise((resolve) => setTimeout(resolve, batchInterval));
 						}
 					}
-				});
-
-				// Wait for all items in the batch to complete
-				const batchResults = await Promise.all(batchPromises);
-				returnData.push(...batchResults);
-
-				// Add delay between batches (except for the last batch)
-				if (batchEnd < items.length && batchInterval > 0) {
-					await new Promise<void>((resolve) => {
-						setTimeout(() => resolve(), batchInterval);
-					});
+					break;
 				}
+
+				case 'listPrompts': {
+					const prompts = await client.listPrompts();
+					returnData.push({
+						json: { prompts },
+					});
+					break;
+				}
+
+				case 'getPrompt': {
+					const promptName = this.getNodeParameter('promptName', 0) as string;
+					const prompt = await client.getPrompt({
+						name: promptName,
+					});
+					returnData.push({
+						json: { prompt },
+					});
+					break;
+				}
+
+				default:
+					throw new NodeOperationError(this.getNode(), `Operation ${operation} not supported`);
 			}
 
 			return [returnData];
